@@ -20,44 +20,78 @@ class ProbSparseAttention(nn.Module):
         self.embed_dim = embed_dim
         self.num_heads = num_heads
         self.dropout = nn.Dropout(dropout)
-        self.scaling = 1 / math.sqrt(embed_dim)
+        # Note: we remove self.scaling here and compute per-head scaling in forward
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         
     def forward(self, query, key, value):
         # query, key, value: (B, L, d_model)
         B, L, d_model = query.size()
         head_dim = d_model // self.num_heads
+        # Use per-head scaling to stabilize the exponentiation operation.
+        local_scaling = 1.0 / math.sqrt(head_dim)
         
         def reshape(x):
             # (B, L, d_model) -> (B, num_heads, L, head_dim)
             return x.view(B, L, self.num_heads, head_dim).transpose(1, 2)
         
-        q = reshape(query)
+        q = reshape(query)  # (B, num_heads, L, head_dim)
         k = reshape(key)
         v = reshape(value)
         
-        # Compute scaled dot-product attention scores: (B, num_heads, L, L)
-        scores = torch.matmul(q, k.transpose(-2, -1)) * self.scaling
+        # Compute raw scores using scaled dot-product for each query-key pair.
+        scores = torch.matmul(q, k.transpose(-2, -1)) * local_scaling  # shape: (B, num_heads, L, L)
         
-        # Determine top-k keys: using u = ceil(log(L+1))
+        # ------------------------------
+        # Sparsity Measurement using an asymmetric exponential kernel
+        # Compute:
+        #   M(q_i, K) = ln((1/L) * sum(exp(raw_scores))) - (1/L) * sum(raw_scores)
+        # where raw_scores = (q_i dot k_j)/sqrt(d_head)
+        # ------------------------------
+        m1 = torch.logsumexp(scores, dim=-1) - math.log(L)   # (B, num_heads, L)
+        m2 = scores.mean(dim=-1)                               # (B, num_heads, L)
+        M_measure = m1 - m2                                    # (B, num_heads, L)
+        
+        # Determine the number of active queries: u = ceil(log(L+1))
         u = max(1, int(math.ceil(math.log(L + 1))))
-        topk_scores, topk_indices = scores.topk(k=u, dim=-1)
         
-        # Create a mask for top-k indices
-        mask = torch.zeros_like(scores, dtype=torch.bool)
-        mask.scatter_(-1, topk_indices, True)
+        # Select top-u queries based on the sparsity measure for each head
+        _, topk_query_indices = M_measure.topk(k=u, dim=-1)  # (B, num_heads, u)
         
-        # Set scores not in top-k to -infinity
-        scores_masked = torch.where(mask, scores, torch.full_like(scores, float('-inf')))
+        # Compute a default output for all queries using the global average of v
+        v_avg = v.mean(dim=2, keepdim=True)  # (B, num_heads, 1, head_dim)
+        default_output = v_avg.expand(B, self.num_heads, L, head_dim).clone()  # (B, num_heads, L, head_dim)
         
-        attn_weights = F.softmax(scores_masked, dim=-1)
-        attn_weights = self.dropout(attn_weights)
+        # Gather active queries based on selected indices
+        q_active = torch.gather(q, dim=2, 
+                                 index=topk_query_indices.unsqueeze(-1).expand(B, self.num_heads, u, head_dim))
         
-        # Compute attention output
-        attn_output = torch.matmul(attn_weights, v)  # (B, num_heads, L, head_dim)
+        # ------------------------------
+        # Final Attention Calculation for active queries:
+        #    Compute scores for active queries using the modified exponential kernel:
+        #    scores_active = (q_active dot k^T)*local_scaling,
+        #    then apply Softmax to obtain the probability distribution over keys.
+        # ------------------------------
+        scores_active = torch.matmul(q_active, k.transpose(-2, -1)) * local_scaling  # (B, num_heads, u, L)
+        attn_weights_active = F.softmax(scores_active, dim=-1)
+        attn_weights_active = self.dropout(attn_weights_active)
+        
+        # Compute output for active queries
+        attn_output_active = torch.matmul(attn_weights_active, v)  # (B, num_heads, u, head_dim)
+        
+        # Scatter the computed outputs for active queries back into the appropriate positions
+        attn_output = default_output  # (B, num_heads, L, head_dim)
+        attn_output.scatter_(2, topk_query_indices.unsqueeze(-1).expand(B, self.num_heads, u, head_dim), 
+                              attn_output_active)
+        
+        # (Optional) Build a corresponding full attention weights tensor with zeros for non-active queries
+        attn_weights_full = torch.zeros(B, self.num_heads, L, L, device=q.device)
+        attn_weights_full.scatter_(2, topk_query_indices.unsqueeze(-1).expand(B, self.num_heads, u, L), 
+                                    attn_weights_active)
+        
+        # Reshape output back to (B, L, d_model) and project to final dimension
         attn_output = attn_output.transpose(1, 2).contiguous().view(B, L, d_model)
         attn_output = self.out_proj(attn_output)
-        return attn_output, attn_weights
+        return attn_output, attn_weights_full
 
 # ------------------------------
 # Positional Encoding Module
@@ -81,6 +115,37 @@ class PositionalEncoding(nn.Module):
         return x
 
 # ------------------------------
+# Global Time Embedding Module
+# ------------------------------
+class TimeEmbedding(nn.Module):
+    def __init__(self, d_model, year_range=(1900, 2100), month_size=12, week_size=53, day_size=32, hour_size=24, minute_size=60):
+        super(TimeEmbedding, self).__init__()
+        self.year_offset = year_range[0]
+        year_num = year_range[1] - year_range[0] + 1
+        self.year_embedding = nn.Embedding(year_num, d_model)
+        self.month_embedding = nn.Embedding(month_size, d_model)
+        self.week_embedding = nn.Embedding(week_size, d_model)
+        self.day_embedding = nn.Embedding(day_size, d_model)
+        self.hour_embedding = nn.Embedding(hour_size, d_model)
+        self.minute_embedding = nn.Embedding(minute_size, d_model)
+
+    def forward(self, time_tensor):
+        # time_tensor: (B, L, 6) where columns are [year, month, week, day, hour, minute]
+        year = (time_tensor[:,:,0].long() - self.year_offset).clamp(min=0)
+        month = (time_tensor[:,:,1].long() - 1).clamp(min=0)
+        week = (time_tensor[:,:,2].long() - 1).clamp(min=0)
+        day = (time_tensor[:,:,3].long() - 1).clamp(min=0)
+        hour = time_tensor[:,:,4].long()
+        minute = time_tensor[:,:,5].long()
+        e_year = self.year_embedding(year)
+        e_month = self.month_embedding(month)
+        e_week = self.week_embedding(week)
+        e_day = self.day_embedding(day)
+        e_hour = self.hour_embedding(hour)
+        e_minute = self.minute_embedding(minute)
+        return e_year + e_month + e_week + e_day + e_hour + e_minute
+
+# ------------------------------
 # Informer Encoder Layer with Distillation
 # ------------------------------
 class InformerEncoderLayer(nn.Module):
@@ -102,8 +167,16 @@ class InformerEncoderLayer(nn.Module):
         )
         self.apply_distillation = apply_distillation
         if self.apply_distillation:
-            # Convolutional distillation: reducing sequence length by half.
-            # Input of shape (B, L, d_model) is transposed to (B, d_model, L)
+            # --------------------------------------------------------------
+            # Self-Attention Distilling Operation (Equation 4):
+            # X₍ⱼ₊₁₎ = MaxPool( ELU( Conv1d( [Xⱼ]ᵀ ) ) )
+            # 
+            # This block first transposes the tensor from shape (B, L, d_model)
+            # to (B, d_model, L) so that a 1D convolution is applied over the 
+            # sequence (time-series) dimension. The ELU activation is then applied 
+            # followed by a max pooling operation, which reduces the sequence length 
+            # roughly by half.
+            # --------------------------------------------------------------
             self.conv = nn.Conv1d(in_channels=d_model, out_channels=d_model,
                                   kernel_size=3, padding=1)
             self.pool = nn.MaxPool1d(kernel_size=2, stride=2)
@@ -116,11 +189,14 @@ class InformerEncoderLayer(nn.Module):
         x_ffn = self.ffn(x)
         x = self.norm2(x + x_ffn)
         if self.apply_distillation:
-            # Apply convolution, ELU activation, and max pooling to reduce L by half.
-            x = x.transpose(1, 2)         # (B, d_model, L)
+            # Apply the self-attention distilling block (Equation 4)
+            # Transpose x from (B, L, d_model) to (B, d_model, L)
+            x = x.transpose(1, 2)
+            # Apply convolution, ELU activation, and max-pooling
             x = self.elu(self.conv(x))
-            x = self.pool(x)              # (B, d_model, L//2)
-            x = x.transpose(1, 2)         # (B, L//2, d_model)
+            x = self.pool(x)  # Reduces sequence length by about half
+            # Transpose back to (B, new_L, d_model) where new_L ≈ L/2
+            x = x.transpose(1, 2)
         return x
 
 # ------------------------------
@@ -131,7 +207,8 @@ class InformerEncoder(nn.Module):
         super(InformerEncoder, self).__init__()
         self.layers = nn.ModuleList()
         for i in range(num_layers):
-            apply_distill = True if i < num_layers - 1 else False
+            # Apply distillation after every self-attention layer to reduce sequence length
+            apply_distill = True
             layer = InformerEncoderLayer(d_model, nhead, d_ff, dropout,
                                          apply_distillation=apply_distill,
                                          use_prob_sparse=use_prob_sparse)
@@ -199,9 +276,9 @@ class Informer(nn.Module):
     def __init__(self, input_dim=12, d_model=64, d_ff=256, nhead=8,
                  enc_layers=3, dec_layers=3, dropout=0.05,
                  encoder_length=96, decoder_length=48, prediction_length=24,
-                 use_prob_sparse=True, time_feature_dim=5):
+                 use_prob_sparse=True):
         super(Informer, self).__init__()
-        self.input_dim = input_dim
+        self.input_dim = input_dim  # Needed to construct dummy tokens later
         self.d_model = d_model
         self.encoder_length = encoder_length
         self.decoder_length = decoder_length
@@ -220,50 +297,52 @@ class Informer(nn.Module):
                                        nhead=nhead, d_ff=d_ff, dropout=dropout, use_prob_sparse=use_prob_sparse)
         # Final projection back to original feature dimension
         self.output_projection = nn.Linear(d_model, input_dim)
-        # Global Time Embedding for decoder (e.g., year, month, week, hour, minute)
-        self.time_embedding = nn.Linear(time_feature_dim, d_model)
+        # Global Time Embedding for decoder using discrete embeddings for each time component:
+        self.time_embed = TimeEmbedding(d_model)
 
     def forward(self, encoder_x, decoder_x, target=None, decoder_time=None):
         """
-        Forward pass of the Informer model.
+        Forward pass of the Informer model implementing generative inference.
 
-        Parameters:
-          - encoder_x: (B, encoder_length, input_dim)
-          - decoder_x: (B, decoder_length, input_dim)  [guiding sequence]
-          - target: (B, prediction_length, input_dim)   [ground truth; used in teacher forcing]
-          - decoder_time: (B, decoder_length + prediction_length, time_feature_dim) [optional time features]
+        The decoder input is constructed by concatenating:
+          - X_token: a guiding (prompt) sequence (decoder_x) providing context.
+          - X_0: a placeholder segment.
 
-        Returns:
-          - predictions: (B, prediction_length, input_dim)
+        During training (teacher forcing), X_0 is replaced with the ground-truth target.
+        During inference, X_0 is initialized as zeros.
+
+        The decoder operates on the full concatenated sequence without strict autoregressive masking,
+        and only the outputs corresponding to X_0 (the prediction segment) are used.
         """
         # Encode the input sequence
         enc_input = self.input_projection(encoder_x)  # (B, encoder_length, d_model)
         enc_input = self.pos_encoder(enc_input)
         memory = self.encoder(enc_input)
 
-        # Prepare decoder input
+        # Prepare decoder input for generative inference (one-shot decoding)
         if target is not None:
-            # For training (teacher forcing): concatenate guiding + ground truth target
             dec_input = torch.cat([decoder_x, target], dim=1)  # (B, decoder_length + prediction_length, input_dim)
         else:
-            # For inference: use only guiding sequence
-            dec_input = decoder_x
+            placeholder = torch.zeros(decoder_x.size(0), self.prediction_length, self.input_dim, device=decoder_x.device)
+            dec_input = torch.cat([decoder_x, placeholder], dim=1)
+
         dec_input = self.input_projection(dec_input)  # (B, L_dec, d_model)
         dec_input = self.pos_decoder(dec_input)
-        # Incorporate global time stamp embeddings if provided
         if decoder_time is not None:
-            time_emb = self.time_embedding(decoder_time)  # (B, L_dec, d_model)
+            # Add global time embeddings if available.
+            # Assume decoder_time shape: (B, decoder_length + prediction_length, 6)
+            time_emb = self.time_embed(decoder_time)  # (B, L_dec, d_model)
             dec_input = dec_input + time_emb
-        # Decode with cross-attention using encoder output
+
+        # Decode with cross-attention using the encoder output.
+        # Note: The decoder attends to the entire concatenated sequence without causal masking.
         dec_output = self.decoder(dec_input, memory)
-        # Project back to feature dimensionality
+
+        # Project the decoder output back to the original feature dimension.
         output = self.output_projection(dec_output)
         
-        # If teacher forcing used, only return the prediction part (last prediction_length tokens)
-        if target is not None:
-            return output[:, -self.prediction_length:, :]
-        else:
-            return output
+        # Return only the segment corresponding to the prediction placeholders (X_0).
+        return output[:, -self.prediction_length:, :]
 
 # ------------------------------
 # Training & Evaluation Functions
@@ -295,9 +374,11 @@ def train_model(model, train_loader, val_loader, num_epochs, optimizer, criterio
             pbar.set_postfix(loss=f"{loss.item():.6f}")
         avg_train_loss = total_loss / len(train_loader)
 
-        # Validation phase
+        # Validation phase with additional metric computation
         model.eval()
         total_val_loss = 0.0
+        val_predictions = []
+        val_targets = []
         with torch.no_grad():
             for batch in val_loader:
                 encoder = batch['encoder'].to(device)
@@ -306,12 +387,17 @@ def train_model(model, train_loader, val_loader, num_epochs, optimizer, criterio
                 output = model(encoder, decoder, target)
                 loss = criterion(output, target)
                 total_val_loss += loss.item()
+                val_predictions.append(output)
+                val_targets.append(target)
         avg_val_loss = total_val_loss / len(val_loader)
+        val_predictions = torch.cat(val_predictions, dim=0)
+        val_targets = torch.cat(val_targets, dim=0)
+        mae, rmse, mape = compute_metrics(val_predictions, val_targets)
 
         # Calculate additional epoch details
         epoch_duration = time.time() - epoch_start_time
         current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, Duration: {epoch_duration:.2f}s, Best Val Loss: {best_val_loss:.6f}, LR: {current_lr:.6e}")
+        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, MAE: {mae:.6f}, RMSE: {rmse:.6f}, MAPE: {mape:.2f}%, Duration: {epoch_duration:.2f}s, Best Val Loss: {best_val_loss:.6f}, LR: {current_lr:.6e}")
         
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
@@ -374,11 +460,11 @@ if __name__ == "__main__":
     encoder_length = 96
     decoder_length = 48
     prediction_length = 24
-    batch_size = 32
+    batch_size = 128
     num_epochs = 20
     learning_rate = 4e-5
 
-    # Device setup optimized for Mac ARM (MPS) and CUDA.
+
     if torch.backends.mps.is_available():
         device = torch.device("mps")
     elif torch.cuda.is_available():
@@ -398,8 +484,7 @@ if __name__ == "__main__":
                      enc_layers=enc_layers, dec_layers=dec_layers, dropout=dropout,
                      encoder_length=encoder_length, decoder_length=decoder_length,
                      prediction_length=prediction_length,
-                     use_prob_sparse=True,      # enable ProbSparse self-attention
-                     time_feature_dim=5)        # assuming 5 time features (e.g., year, month, week, hour, minute)
+                     use_prob_sparse=True)        # enable ProbSparse self-attention
     model.to(device)
 
     # Define loss function and optimizer (MSE loss for regression)
