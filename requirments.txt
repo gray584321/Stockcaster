@@ -1,0 +1,11 @@
+pandas
+numpy
+matplotlib
+seaborn
+scikit-learn
+requests
+python-dotenv
+tqdm
+pandas-market-calendars
+requests_html 
+yahoo_fin
