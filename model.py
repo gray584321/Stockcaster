@@ -7,6 +7,21 @@ import numpy as np
 from torch.optim import Adam
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
+import matplotlib.pyplot as plt   # <-- new import for plotting
+import os                        # <-- new import for creating folders and paths
+import pandas as pd              # <-- new import for saving CSV files
+import random  # added for random seed setting
+
+# Define helper function for setting the random seed for reproducibility
+def set_random_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 # Import the custom StockDataLoader defined in dataloader.py
 from dataloader import StockDataLoader
@@ -23,7 +38,7 @@ class ProbSparseAttention(nn.Module):
         # Note: we remove self.scaling here and compute per-head scaling in forward
         self.out_proj = nn.Linear(embed_dim, embed_dim)
         
-    def forward(self, query, key, value):
+    def forward(self, query, key, value, attn_mask=None):
         # query, key, value: (B, L, d_model)
         B, L, d_model = query.size()
         head_dim = d_model // self.num_heads
@@ -72,6 +87,13 @@ class ProbSparseAttention(nn.Module):
         #    then apply Softmax to obtain the probability distribution over keys.
         # ------------------------------
         scores_active = torch.matmul(q_active, k.transpose(-2, -1)) * local_scaling  # (B, num_heads, u, L)
+        # --- Newly Added: Apply causal mask if provided ---
+        if attn_mask is not None:
+            # attn_mask is expected to be of shape (L, L) [boolean mask]
+            # Gather the mask rows according to the active query indices:
+            causal_mask_active = attn_mask[topk_query_indices]  # (B, num_heads, u, L)
+            scores_active = scores_active.masked_fill(causal_mask_active, float('-inf'))
+        
         attn_weights_active = F.softmax(scores_active, dim=-1)
         attn_weights_active = self.dropout(attn_weights_active)
         
@@ -245,8 +267,17 @@ class InformerDecoderLayer(nn.Module):
         )
 
     def forward(self, x, memory):
-        x_self, _ = self.self_attn(x, x, x)
+        # ------------------------------
+        # Newly Added: Generate a causal mask for masked self-attention in the decoder.
+        # This mask prevents attending to future time steps.
+        # ------------------------------
+        L = x.size(1)
+        causal_mask = torch.triu(torch.ones(L, L, device=x.device), diagonal=1).bool()
+        
+        # Pass the causal mask to self-attention.
+        x_self, _ = self.self_attn(x, x, x, attn_mask=causal_mask)
         x = self.norm1(x + x_self)
+        
         x_cross, _ = self.cross_attn(x, memory, memory)
         x = self.norm2(x + x_cross)
         x_ffn = self.ffn(x)
@@ -460,8 +491,8 @@ if __name__ == "__main__":
     encoder_length = 96
     decoder_length = 48
     prediction_length = 24
-    batch_size = 128
-    num_epochs = 20
+    batch_size = 64
+    num_epochs = 25
     learning_rate = 4e-5
 
 
@@ -471,6 +502,12 @@ if __name__ == "__main__":
         device = torch.device("cuda")
     else:
         device = torch.device("cpu")
+    
+    # Set random seed for reproducibility
+    seed = 69
+    set_random_seed(seed)
+    print(f"Random seed set to: {seed}... hehe")
+
     print(f"Using device: {device}")
 
     # Initialize the custom data loader (CSV path should be adjusted as needed)
@@ -498,3 +535,52 @@ if __name__ == "__main__":
     predictions, targets = evaluate_model(model, test_loader, criterion, device)
     mae, rmse, mape = compute_metrics(predictions, targets)
     print(f"Test Metrics - MAE: {mae:.6f}, RMSE: {rmse:.6f}, MAPE: {mape:.2f}%") 
+
+    # ------------------------------
+    # New Code: Save Plot and CSV of Test Predictions vs Ground Truth
+    # ------------------------------
+    # Create a folder "results" if it doesn't exist
+    results_folder = "results"
+    os.makedirs(results_folder, exist_ok=True)
+    
+    # Convert predictions and targets to NumPy arrays
+    pred_np = predictions.cpu().numpy()   # shape: (num_samples, prediction_length, input_dim)
+    target_np = targets.cpu().numpy()
+    
+    # For plotting, choose the first sample and the first feature for demonstration.
+    sample_idx = 0
+    feature_idx = 0
+    pred_series = pred_np[sample_idx, :, feature_idx]
+    target_series = target_np[sample_idx, :, feature_idx]
+    time_steps = range(1, len(pred_series) + 1)
+    
+    plt.figure(figsize=(10, 6))
+    plt.plot(time_steps, target_series, label="Ground Truth", marker='o')
+    plt.plot(time_steps, pred_series, label="Prediction", marker='x')
+    plt.xlabel("Time Step")
+    plt.ylabel("Value")
+    plt.title(f"Ground Truth vs Prediction (Sample {sample_idx}, Feature {feature_idx})")
+    plt.legend()
+    plt.grid(True)
+    plot_path = os.path.join(results_folder, "ground_truth_vs_prediction.png")
+    plt.savefig(plot_path)
+    plt.close()
+    print(f"Saved prediction plot to {plot_path}")
+    
+    # Save raw predictions vs ground truth in a CSV file for the first feature across all test samples.
+    num_samples, pred_length, _ = pred_np.shape
+    # Flatten sample and time steps for the first feature...
+    sample_ids = np.repeat(np.arange(num_samples), pred_length)
+    time_steps_full = np.tile(np.arange(pred_length), num_samples)
+    ground_truth_flat = target_np[:, :, feature_idx].flatten()
+    prediction_flat = pred_np[:, :, feature_idx].flatten()
+    
+    df = pd.DataFrame({
+        "sample": sample_ids,
+        "time_step": time_steps_full,
+        "ground_truth": ground_truth_flat,
+        "prediction": prediction_flat
+    })
+    csv_path = os.path.join(results_folder, "test_predictions_vs_ground_truth.csv")
+    df.to_csv(csv_path, index=False)
+    print(f"Saved raw predictions and ground truth data to {csv_path}") 

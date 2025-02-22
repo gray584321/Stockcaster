@@ -190,18 +190,48 @@ class StockDataLoader:
         """Runs the entire pipeline: CSV ingestion, feature engineering, normalization, window generation, and splitting."""
         self.load_csv()
         self.engineer_time_features()
-        if self.include_technical_indicators:
-            self.compute_technical_indicators()
+        self.compute_technical_indicators()
         self.prepare_features()
         self.normalize_features()
         self.generate_windows()
         self.split_data()
 
     def compute_technical_indicators(self):
-        """Optionally computes technical indicators like SMA and EMA for the 'close' price."""
-        # Compute a simple moving average (SMA) and an exponential moving average (EMA) with a window/span of 5
-        self.dataframe['sma_close'] = self.dataframe['close'].rolling(window=5, min_periods=1).mean()
-        self.dataframe['ema_close'] = self.dataframe['close'].ewm(span=5, adjust=False).mean()
+        """Optionally computes technical indicators for the 'close' price.
+        Added indicators: SMA (window=5), EMA (span=5), RSI (14), MACD, Bollinger Bands, and OBV.
+        Then removes rows with any missing values.
+        """
+        df = self.dataframe
+
+        df['sma_close'] = df['close'].rolling(window=5, min_periods=1).mean()
+        df['ema_close'] = df['close'].ewm(span=5, adjust=False).mean()
+
+        delta = df['close'].diff()
+        gain = delta.clip(lower=0)
+        loss = -delta.clip(upper=0)
+        avg_gain = gain.rolling(window=14, min_periods=14).mean()
+        avg_loss = loss.rolling(window=14, min_periods=14).mean()
+        rs = avg_gain / (avg_loss + 1e-10)
+        df['rsi_14'] = 100 - (100 / (1 + rs))
+
+        ema12 = df['close'].ewm(span=12, adjust=False).mean()
+        ema26 = df['close'].ewm(span=26, adjust=False).mean()
+        df['macd'] = ema12 - ema26
+        df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
+        df['macd_histogram'] = df['macd'] - df['macd_signal']
+
+        window = 20
+        sma_20 = df['close'].rolling(window=window, min_periods=window).mean()
+        std_20 = df['close'].rolling(window=window, min_periods=window).std()
+        df['bollinger_upper'] = sma_20 + (std_20 * 2)
+        df['bollinger_lower'] = sma_20 - (std_20 * 2)
+
+        # On-Balance Volume (OBV)
+        df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
+
+        # Drop rows with any missing values after indicator calculations
+        df.dropna(inplace=True)
+        self.dataframe = df
 
     def inverse_transform(self, data):
         """Inverse transforms the normalized features using the fitted scaler.
