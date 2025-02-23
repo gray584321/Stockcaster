@@ -248,7 +248,7 @@ def fill_missing_intraday_data_with_mid_price(df: pd.DataFrame, calendar_name: s
 # ---------------------------
 def main():
     # Hardcoded parameters:
-    file_path = "/Users/grantray/Desktop/infomer/data/raw/SPY.csv"
+    file_path = "/Users/grantray/Desktop/infomer/data/raw/TSLA.csv"
     freq = "min"  # Expected frequency (1 minute intervals)
     calendar_name = "NYSE"  # Market calendar to use
 

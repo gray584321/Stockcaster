@@ -109,7 +109,16 @@ class StockDataLoader:
         df = self.dataframe
         stock_columns = ['open', 'high', 'low', 'close', 'volume']
         if self.include_technical_indicators:
-            stock_columns.extend(['sma_close', 'ema_close'])
+            technical_columns = [
+                'sma_close', 'ema_close', 'rsi_14', 'macd',
+                'macd_signal', 'macd_histogram', 'bollinger_upper',
+                'bollinger_lower', 'obv',
+                '5min_mean_close', '15min_mean_close',
+                '5min_rolling_volatility', '15min_rolling_volatility',
+                '5min_realized_variance', '15min_realized_variance',
+                'price_return', 'return_volume_interaction', 'log_volume'
+            ]
+            stock_columns.extend(technical_columns)
         stock_features = df[stock_columns]
         time_features = df[self.global_feature_names]
         full_features = pd.concat([stock_features, time_features], axis=1)
@@ -190,7 +199,9 @@ class StockDataLoader:
         """Runs the entire pipeline: CSV ingestion, feature engineering, normalization, window generation, and splitting."""
         self.load_csv()
         self.engineer_time_features()
-        self.compute_technical_indicators()
+        # Only compute technical indicators (and additional features) if enabled
+        if self.include_technical_indicators:
+            self.compute_technical_indicators()
         self.prepare_features()
         self.normalize_features()
         self.generate_windows()
@@ -198,7 +209,8 @@ class StockDataLoader:
 
     def compute_technical_indicators(self):
         """Optionally computes technical indicators for the 'close' price.
-        Added indicators: SMA (window=5), EMA (span=5), RSI (14), MACD, Bollinger Bands, and OBV.
+        Added indicators: SMA (window=5), EMA (span=5), RSI (14), MACD, Bollinger Bands, OBV,
+        as well as mixed‑frequency aggregated features, rolling volatility/variance, and interaction terms.
         Then removes rows with any missing values.
         """
         df = self.dataframe
@@ -228,6 +240,23 @@ class StockDataLoader:
 
         # On-Balance Volume (OBV)
         df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
+
+        # -------------------------------
+        # New: Mixed‑Frequency and Aggregated Features
+        df['5min_mean_close'] = df['close'].rolling(window=5, min_periods=1).mean()
+        df['15min_mean_close'] = df['close'].rolling(window=15, min_periods=1).mean()
+
+        # New: Rolling Volatility and Realized Variance
+        df['5min_rolling_volatility'] = df['close'].pct_change().rolling(window=5, min_periods=1).std()
+        df['15min_rolling_volatility'] = df['close'].pct_change().rolling(window=15, min_periods=1).std()
+        df['5min_realized_variance'] = (df['close'].pct_change() ** 2).rolling(window=5, min_periods=1).sum()
+        df['15min_realized_variance'] = (df['close'].pct_change() ** 2).rolling(window=15, min_periods=1).sum()
+
+        # New: Interaction Terms and Nonlinear Transformations
+        df['price_return'] = df['close'].pct_change()
+        df['return_volume_interaction'] = df['price_return'] * df['volume']
+        df['log_volume'] = np.log(df['volume'] + 1)
+        # -------------------------------
 
         # Drop rows with any missing values after indicator calculations
         df.dropna(inplace=True)

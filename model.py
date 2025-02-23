@@ -447,6 +447,8 @@ def evaluate_model(model, test_loader, criterion, device):
     total_test_loss = 0.0
     predictions = []
     targets = []
+    datetime_list = []  # <-- new list to collect datetime info
+
     with torch.no_grad():
         for batch in test_loader:
             encoder = batch['encoder'].to(device)
@@ -457,13 +459,25 @@ def evaluate_model(model, test_loader, criterion, device):
             total_test_loss += loss.item()
             predictions.append(output)
             targets.append(target)
+            # If the batch includes datetime information, collect it.
+            if 'datetime' in batch:
+                # Assumes batch['datetime'] is a list-like (e.g. a list of prediction datetimes)
+                datetime_list.append(batch['datetime'])
     avg_test_loss = total_test_loss / len(test_loader)
     print(f"Test Loss: {avg_test_loss:.6f}")
-    
-    # Concatenate batches together
+
+    # Concatenate over batches
     predictions = torch.cat(predictions, dim=0)
     targets = torch.cat(targets, dim=0)
-    return predictions, targets
+
+    # Flatten the datetime_list if available (if provided per time step)
+    if datetime_list:
+        # If each batch returned a list, flatten them
+        datetimes = [dt for sublist in datetime_list for dt in sublist]
+    else:
+        datetimes = None
+
+    return predictions, targets, datetimes
 
 def compute_metrics(pred, target):
     """
@@ -491,7 +505,7 @@ if __name__ == "__main__":
     encoder_length = 96
     decoder_length = 48
     prediction_length = 24
-    batch_size = 64
+    batch_size = 128
     num_epochs = 25
     learning_rate = 4e-5
 
@@ -531,23 +545,30 @@ if __name__ == "__main__":
     # Train the model
     train_model(model, train_loader, val_loader, num_epochs, optimizer, criterion, device)
 
-    # Evaluate on test set
-    predictions, targets = evaluate_model(model, test_loader, criterion, device)
+    # Evaluate on test set (note: now we unpack datetimes as well)
+    predictions, targets, datetimes = evaluate_model(model, test_loader, criterion, device)
     mae, rmse, mape = compute_metrics(predictions, targets)
     print(f"Test Metrics - MAE: {mae:.6f}, RMSE: {rmse:.6f}, MAPE: {mape:.2f}%") 
 
     # ------------------------------
-    # New Code: Save Plot and CSV of Test Predictions vs Ground Truth
+    # New: Un-normalize the predictions for the close prices
     # ------------------------------
-    # Create a folder "results" if it doesn't exist
-    results_folder = "results"
-    os.makedirs(results_folder, exist_ok=True)
-    
     # Convert predictions and targets to NumPy arrays
     pred_np = predictions.cpu().numpy()   # shape: (num_samples, prediction_length, input_dim)
     target_np = targets.cpu().numpy()
     
-    # For plotting, choose the first sample and the first feature for demonstration.
+    # Assume these normalization parameters were used during training.
+    # Adjust these values to match your actual transformation.
+    close_price_mean = 100.0   # example mean value of the close price
+    close_price_std = 20.0     # example std deviation used during normalization
+    
+    # Unnormalize the "close price" (assumed to be feature index 0)
+    pred_np[:, :, 0] = pred_np[:, :, 0] * close_price_std + close_price_mean
+    target_np[:, :, 0] = target_np[:, :, 0] * close_price_std + close_price_mean
+
+    # ------------------------------
+    # Plotting for a single sample (using the un-normalized close price)
+    # ------------------------------
     sample_idx = 0
     feature_idx = 0
     pred_series = pred_np[sample_idx, :, feature_idx]
@@ -558,7 +579,7 @@ if __name__ == "__main__":
     plt.plot(time_steps, target_series, label="Ground Truth", marker='o')
     plt.plot(time_steps, pred_series, label="Prediction", marker='x')
     plt.xlabel("Time Step")
-    plt.ylabel("Value")
+    plt.ylabel("Close Price")
     plt.title(f"Ground Truth vs Prediction (Sample {sample_idx}, Feature {feature_idx})")
     plt.legend()
     plt.grid(True)
@@ -567,9 +588,10 @@ if __name__ == "__main__":
     plt.close()
     print(f"Saved prediction plot to {plot_path}")
     
-    # Save raw predictions vs ground truth in a CSV file for the first feature across all test samples.
+    # ------------------------------
+    # Save raw predictions vs ground truth in a CSV file and include prediction datetime.
+    # ------------------------------
     num_samples, pred_length, _ = pred_np.shape
-    # Flatten sample and time steps for the first feature...
     sample_ids = np.repeat(np.arange(num_samples), pred_length)
     time_steps_full = np.tile(np.arange(pred_length), num_samples)
     ground_truth_flat = target_np[:, :, feature_idx].flatten()
@@ -581,6 +603,20 @@ if __name__ == "__main__":
         "ground_truth": ground_truth_flat,
         "prediction": prediction_flat
     })
+    
+    # Add datetime column if available.
+    if datetimes is not None:
+        # Depending on how your dataloader returns datetime,
+        # the length could be either num_samples*pred_length or num_samples.
+        if len(datetimes) == num_samples * pred_length:
+            df["datetime"] = datetimes
+        elif len(datetimes) == num_samples:
+            df["datetime"] = np.repeat(datetimes, pred_length)
+        else:
+            df["datetime"] = None
+    else:
+        df["datetime"] = None
+    
     csv_path = os.path.join(results_folder, "test_predictions_vs_ground_truth.csv")
     df.to_csv(csv_path, index=False)
     print(f"Saved raw predictions and ground truth data to {csv_path}") 

@@ -1,0 +1,23 @@
+2025-02-22 18:54:24,135 - INFO: Starting dataset creation and inspection.
+2025-02-22 18:54:24,137 - INFO: Original CSV columns are: ['datetime', 'open', 'high', 'low', 'close', 'volume', 'vwap', 'num_trades']
+2025-02-22 18:54:24,137 - INFO: Loading data from /Users/grantray/Desktop/infomer/data/raw/TSLA.csv
+2025-02-22 18:54:24,633 - INFO: Data loaded successfully with shape: (1038567, 8)
+2025-02-22 18:54:24,712 - INFO: Completed data type conversions.
+2025-02-22 18:54:24,722 - INFO: Missing values per column:
+2025-02-22 18:54:24,722 - INFO:   open: 0 missing (0.00% of 1038567 rows)
+2025-02-22 18:54:24,722 - INFO:   high: 0 missing (0.00% of 1038567 rows)
+2025-02-22 18:54:24,722 - INFO:   low: 0 missing (0.00% of 1038567 rows)
+2025-02-22 18:54:24,722 - INFO:   close: 0 missing (0.00% of 1038567 rows)
+2025-02-22 18:54:24,722 - INFO:   volume: 0 missing (0.00% of 1038567 rows)
+2025-02-22 18:54:24,722 - INFO:   vwap: 0 missing (0.00% of 1038567 rows)
+2025-02-22 18:54:24,722 - INFO:   num_trades: 0 missing (0.00% of 1038567 rows)
+2025-02-22 18:54:26,669 - INFO: Number of complete days (with full dataset): 1253
+2025-02-22 18:54:26,742 - INFO: Number of incomplete days (with missing dataset): 4
+2025-02-22 18:54:26,742 - INFO: Incomplete days:
+2025-02-22 18:54:26,742 - INFO: 2020-03-09 00:00:00
+2025-02-22 18:54:26,742 - INFO: 2020-03-12 00:00:00
+2025-02-22 18:54:26,742 - INFO: 2020-03-16 00:00:00
+2025-02-22 18:54:26,742 - INFO: 2020-03-18 00:00:00
+2025-02-22 18:54:26,742 - INFO: Dataset inspection completed.
+2025-02-22 18:54:30,099 - INFO: Restored column names from the original CSV header.
+2025-02-22 18:54:31,824 - INFO: Processed trading data saved to /Users/grantray/Desktop/infomer/data/raw/../processed/TSLA.csv

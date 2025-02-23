@@ -5,7 +5,9 @@ __pycache__/
 
 # C extensions
 *.so
-
+*.pdf
+*.png
+*.csv
 # Distribution / packaging
 .Python
 build/
@@ -71,7 +73,7 @@ best_informer_model.pt
 logs/
 
 # Data directories (raw/processed data)
-
+*.pt
 *.csv
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/ 
