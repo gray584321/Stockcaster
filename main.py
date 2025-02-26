@@ -9,22 +9,31 @@ import numpy as np
 from informer.model_components import Informer
 from informer.training_utils import set_random_seed, train_model, evaluate_model, compute_metrics
 from informer.dataloader import StockDataLoader
+from informer.loss_functions import CombinedLoss, DirectionalLoss, AsymmetricLoss
 
 
 if __name__ == "__main__":
     # Model hyperparameters
-    d_model = 64
-    d_ff = 256
+    d_model = 256
+    d_ff = 1024
     nhead = 8
     enc_layers = 3
     dec_layers = 3
-    dropout = 0.085
+    dropout = 0.1
     encoder_length = 96
     decoder_length = 48
     prediction_length = 24
-    batch_size = 32
+    batch_size = 64
     num_epochs = 50
     learning_rate = 4e-5
+
+    # Loss function hyperparameters
+    mse_weight = 0.7
+    mae_weight = 0.3
+    directional_weight = 0.5  # Set > 0 to enable
+    asymmetric_weight = 0.5   # Set > 0 to enable
+    asymmetric_alpha = 1.5    # > 1 to penalize under-predictions more
+    asymmetric_beta = 1.0     # > 1 to penalize over-predictions more
 
     # Set up device
     if torch.backends.mps.is_available():
@@ -42,7 +51,7 @@ if __name__ == "__main__":
 
     # Load data
     csv_path = "data/processed/SPY.csv"
-    stock_data_loader = StockDataLoader(csv_path, use_cyclical_encoding=True, include_technical_indicators=True)
+    stock_data_loader = StockDataLoader(csv_path, use_cyclical_encoding=True, include_technical_indicators=False)
     stock_data_loader.prepare_datasets()
     train_loader, val_loader, test_loader = stock_data_loader.get_dataloaders(batch_size=batch_size)
     
@@ -65,7 +74,15 @@ if __name__ == "__main__":
         "batch_size": batch_size,
         "learning_rate": learning_rate,
         "seed": seed,
-        "device": str(device)
+        "device": str(device),
+        # Loss function parameters
+        "loss_function": "CombinedLoss",
+        "mse_weight": mse_weight,
+        "mae_weight": mae_weight,
+        "directional_weight": directional_weight,
+        "asymmetric_weight": asymmetric_weight,
+        "asymmetric_alpha": asymmetric_alpha,
+        "asymmetric_beta": asymmetric_beta
     }
     
     # Initialize wandb with the updated config
@@ -82,7 +99,14 @@ if __name__ == "__main__":
     wandb.run.summary["model_architecture"] = str(model)
     
     # Set up loss and optimizer
-    criterion = nn.MSELoss()
+    criterion = CombinedLoss(
+        mse_weight=mse_weight, 
+        mae_weight=mae_weight,
+        directional_weight=directional_weight,
+        asymmetric_weight=asymmetric_weight,
+        asymmetric_alpha=asymmetric_alpha,
+        asymmetric_beta=asymmetric_beta
+    )
     optimizer = Adam(model.parameters(), lr=learning_rate)
     
     # Train model
@@ -90,8 +114,12 @@ if __name__ == "__main__":
     
     # Evaluate model
     predictions, targets, datetimes = evaluate_model(model, test_loader, criterion, device)
+    # Additionally calculate metrics with standard MSE for comparison
+    standard_criterion = nn.MSELoss()
+    with torch.no_grad():
+        standard_loss = standard_criterion(predictions, targets).item()
     mae, rmse, mape = compute_metrics(predictions, targets)
-    print(f"Test Metrics - MAE: {mae:.6f}, RMSE: {rmse:.6f}, MAPE: {mape:.2f}%")
+    print(f"Test Metrics - MAE: {mae:.6f}, RMSE: {rmse:.6f}, MAPE: {mape:.2f}%, MSE: {standard_loss:.6f}")
     
     # Denormalize predictions for visualization
     pred_np = predictions.cpu().numpy()

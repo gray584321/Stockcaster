@@ -33,6 +33,49 @@ def compute_metrics(pred, target):
     return mae, rmse, mape
 
 
+def compute_individual_losses(pred, target, criterion):
+    """
+    Compute individual loss components for monitoring
+    """
+    loss_components = {}
+    
+    # Standard losses
+    mse_loss = nn.MSELoss()(pred, target).item()
+    mae_loss = nn.L1Loss()(pred, target).item()
+    loss_components["mse"] = mse_loss
+    loss_components["mae"] = mae_loss
+    
+    # Combined loss (what we're optimizing)
+    combined_loss = criterion(pred, target).item()
+    loss_components["combined_loss"] = combined_loss
+    
+    # Check if criterion has the component weights attributes
+    if hasattr(criterion, 'mse_weight'):
+        loss_components["mse_weight"] = criterion.mse_weight
+    if hasattr(criterion, 'mae_weight'):
+        loss_components["mae_weight"] = criterion.mae_weight
+    if hasattr(criterion, 'directional_weight'):
+        loss_components["directional_weight"] = criterion.directional_weight
+    if hasattr(criterion, 'asymmetric_weight'):
+        loss_components["asymmetric_weight"] = criterion.asymmetric_weight
+    
+    # Calculate directional component if available
+    if hasattr(criterion, 'directional_loss') and criterion.directional_loss is not None:
+        pred_diff = pred[:, 1:, 0] - pred[:, :-1, 0]
+        target_diff = target[:, 1:, 0] - target[:, :-1, 0]
+        direction_match = torch.sign(pred_diff) * torch.sign(target_diff)
+        directional_penalty = torch.clamp(-direction_match, min=0).mean().item()
+        loss_components["directional_penalty"] = directional_penalty
+    
+    # Calculate asymmetric component if available
+    if hasattr(criterion, 'asymmetric_loss') and criterion.asymmetric_loss is not None:
+        errors = pred - target
+        under_predictions = (errors < 0).float().mean().item()
+        loss_components["under_prediction_rate"] = under_predictions
+    
+    return loss_components
+
+
 def train_model(model, train_loader, val_loader, num_epochs, optimizer, criterion, device, config=None):
     best_val_loss = float('inf')
     epochs_without_improvement = 0
@@ -92,6 +135,10 @@ def train_model(model, train_loader, val_loader, num_epochs, optimizer, criterio
         val_predictions = torch.cat(val_predictions, dim=0)
         val_targets = torch.cat(val_targets, dim=0)
         mae, rmse, mape = compute_metrics(val_predictions, val_targets)
+        
+        # Compute and log individual loss components for validation data
+        loss_components = compute_individual_losses(val_predictions, val_targets, criterion)
+        
         epoch_duration = time.time() - epoch_start_time
         current_lr = optimizer.param_groups[0]['lr']
         print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, "
@@ -107,8 +154,13 @@ def train_model(model, train_loader, val_loader, num_epochs, optimizer, criterio
                 "rmse": rmse,
                 "mape": mape,
                 "epoch_duration": epoch_duration,
-                "learning_rate": current_lr
+                "learning_rate": current_lr,
             }
+            
+            # Add individual loss components to metrics
+            for component_name, component_value in loss_components.items():
+                metrics[f"val_{component_name}"] = component_value
+                
             wandb.log(metrics)
             if epoch % 5 == 0 or epoch == num_epochs - 1:
                 fig = plt.figure(figsize=(10, 6))
@@ -183,12 +235,21 @@ def evaluate_model(model, test_loader, criterion, device):
     
     if wandb.run is not None:
         mae, rmse, mape = compute_metrics(predictions, targets)
+        
+        # Compute and log individual loss components for test data
+        loss_components = compute_individual_losses(predictions, targets, criterion)
+        
         test_metrics = {
             "test_loss": avg_test_loss,
             "test_mae": mae,
             "test_rmse": rmse,
-            "test_mape": mape
+            "test_mape": mape,
         }
+        
+        # Add individual loss components to metrics
+        for component_name, component_value in loss_components.items():
+            test_metrics[f"test_{component_name}"] = component_value
+            
         wandb.log(test_metrics)
         wandb.run.summary.update(test_metrics)
     

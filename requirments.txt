@@ -9,4 +9,4 @@ tqdm
 pandas-market-calendars
 requests_html 
 yahoo_fin
-neuralforcast
+wandb
