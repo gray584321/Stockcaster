@@ -78,3 +78,4 @@ logs/
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/ 
 .conda
+wandb

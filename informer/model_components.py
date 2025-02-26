@@ -2,27 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import math
-import time
-import numpy as np
-from torch.optim import Adamçç
-from tqdm.auto import tqdm
-import matplotlib.pyplot as plt
-import os
-import pandas as pd
-import random
-from torch.cuda.amp import autocast, GradScaler
 
-def set_random_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-
-from dataloader import StockDataLoader
 
 class ProbSparseAttention(nn.Module):
     def __init__(self, embed_dim, num_heads, dropout=0.0):
@@ -67,6 +47,164 @@ class ProbSparseAttention(nn.Module):
         attn_output = self.out_proj(attn_output)
         return attn_output, attn_weights_full
 
+
+class MultiPathSparseAttention(nn.Module):
+    """
+    An improved sparse attention mechanism inspired by recent advances like DeepSeek's
+    Native Sparse Attention (NSA), which uses multiple attention paths to better handle
+    different aspects of the sequence data.
+    """
+    def __init__(self, embed_dim, num_heads, dropout=0.0, sliding_window=128):
+        super().__init__()
+        self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        self.dropout = nn.Dropout(dropout)
+        self.sliding_window = sliding_window
+        
+        # Projection matrices
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
+        
+        # Token compressors for global path
+        self.compressor = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim),
+            nn.GELU(),
+            nn.Linear(embed_dim, embed_dim),
+        )
+        
+        self.path_mixer = nn.Parameter(torch.ones(3) / 3)  # Learnable weights for each path
+        
+    def _reshape_for_multi_head(self, x):
+        B, L, D = x.shape
+        return x.view(B, L, self.num_heads, self.head_dim).transpose(1, 2)
+    
+    def forward(self, query, key, value, attn_mask=None):
+        B, L, D = query.size()
+        
+        # Project inputs
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+        
+        # Reshape for multi-head attention
+        q_reshaped = self._reshape_for_multi_head(q)
+        k_reshaped = self._reshape_for_multi_head(k)
+        v_reshaped = self._reshape_for_multi_head(v)
+        
+        # 1. Global path (compressed attention)
+        # Compress keys and values to reduce computation
+        compression_ratio = min(4, max(1, L // 64))  # Adaptive compression ratio
+        if compression_ratio > 1:
+            # Apply compression to get fewer tokens
+            k_compressed = k.view(B, -1, compression_ratio, D).mean(dim=2)
+            v_compressed = v.view(B, -1, compression_ratio, D).mean(dim=2)
+            k_global = self._reshape_for_multi_head(self.compressor(k_compressed))
+            v_global = self._reshape_for_multi_head(v_compressed)
+            
+            # Global attention with compressed keys and values
+            scores_global = torch.matmul(q_reshaped, k_global.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if attn_mask is not None:
+                # Need to adapt mask for compressed keys
+                compressed_mask = attn_mask[:, :, ::compression_ratio]
+                scores_global = scores_global.masked_fill(compressed_mask.unsqueeze(1), float('-inf'))
+            attn_weights_global = F.softmax(scores_global, dim=-1)
+            attn_weights_global = self.dropout(attn_weights_global)
+            global_output = torch.matmul(attn_weights_global, v_global)
+        else:
+            # If sequence is short, use regular attention
+            k_global = k_reshaped
+            v_global = v_reshaped
+            scores_global = torch.matmul(q_reshaped, k_global.transpose(-2, -1)) / math.sqrt(self.head_dim)
+            if attn_mask is not None:
+                scores_global = scores_global.masked_fill(attn_mask.unsqueeze(1), float('-inf'))
+            attn_weights_global = F.softmax(scores_global, dim=-1)
+            attn_weights_global = self.dropout(attn_weights_global)
+            global_output = torch.matmul(attn_weights_global, v_global)
+        
+        # 2. Local path (sliding window attention)
+        # Create a sliding window mask to focus on nearby tokens
+        window_size = min(self.sliding_window, L)
+        local_mask = torch.ones(L, L, dtype=torch.bool, device=query.device)
+        for i in range(L):
+            start = max(0, i - window_size // 2)
+            end = min(L, i + window_size // 2 + 1)
+            local_mask[i, start:end] = False
+        
+        # Apply sliding window attention
+        scores_local = torch.matmul(q_reshaped, k_reshaped.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores_local = scores_local.masked_fill(local_mask.unsqueeze(0).unsqueeze(0), float('-inf'))
+        if attn_mask is not None:
+            scores_local = scores_local.masked_fill(attn_mask.unsqueeze(1), float('-inf'))
+        attn_weights_local = F.softmax(scores_local, dim=-1)
+        attn_weights_local = self.dropout(attn_weights_local)
+        local_output = torch.matmul(attn_weights_local, v_reshaped)
+        
+        # 3. Sparse path (top-k selection)
+        # Use ProbSparse-like selection for the most important tokens
+        scores_selection = torch.matmul(q_reshaped, k_reshaped.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        m1 = torch.logsumexp(scores_selection, dim=-1) - math.log(L)
+        m2 = scores_selection.mean(dim=-1)
+        importance_scores = m1 - m2
+        
+        # Select top-k queries for each head
+        u = max(1, int(math.ceil(math.log(L + 1))))
+        _, topk_query_indices = importance_scores.topk(k=u, dim=-1)
+        
+        # Gather the selected queries
+        batch_indices = torch.arange(B, device=query.device).view(B, 1, 1, 1).expand(B, self.num_heads, u, 1)
+        head_indices = torch.arange(self.num_heads, device=query.device).view(1, self.num_heads, 1, 1).expand(B, self.num_heads, u, 1)
+        gather_indices = torch.cat([batch_indices, head_indices, topk_query_indices.unsqueeze(-1)], dim=-1)
+        
+        # Compute attention for selected queries
+        q_selected = q_reshaped.gather(2, topk_query_indices.unsqueeze(-1).expand(B, self.num_heads, u, self.head_dim))
+        scores_selected = torch.matmul(q_selected, k_reshaped.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        if attn_mask is not None:
+            # Create mask for selected queries
+            selected_mask = torch.gather(attn_mask.unsqueeze(1).expand(B, self.num_heads, L, L), 2, 
+                                       topk_query_indices.unsqueeze(-1).expand(B, self.num_heads, u, L))
+            scores_selected = scores_selected.masked_fill(selected_mask, float('-inf'))
+        
+        attn_weights_selected = F.softmax(scores_selected, dim=-1)
+        attn_weights_selected = self.dropout(attn_weights_selected)
+        selected_output = torch.matmul(attn_weights_selected, v_reshaped)
+        
+        # Create a placeholder for the full output based on the sparse selection
+        sparse_output = torch.zeros_like(q_reshaped)
+        
+        # Convert sparse_output to a list for scatter operation
+        sparse_output_list = list(sparse_output.unbind(dim=2))
+        selected_output_list = list(selected_output.unbind(dim=2))
+        
+        # Scatter the selected outputs back to their original positions
+        for i, idx in enumerate(topk_query_indices.unbind(dim=2)):
+            for b in range(B):
+                for h in range(self.num_heads):
+                    sparse_output_list[idx[b, h].item()][b, h] = selected_output_list[i][b, h]
+        
+        # Rebuild the sparse_output tensor
+        sparse_output = torch.stack(sparse_output_list, dim=2)
+        
+        # Combine all paths with learnable weights
+        path_weights = F.softmax(self.path_mixer, dim=0)
+        combined_output = (
+            path_weights[0] * global_output + 
+            path_weights[1] * local_output + 
+            path_weights[2] * sparse_output
+        )
+        
+        # Reshape back to original dimensions
+        combined_output = combined_output.transpose(1, 2).contiguous().view(B, L, D)
+        output = self.out_proj(combined_output)
+        
+        # For compatibility with the other attention modules
+        attn_weights = (attn_weights_global + attn_weights_local) / 2
+        
+        return output, attn_weights
+
+
 class PositionalEncoding(nn.Module):
     def __init__(self, d_model, max_len=1000):
         super().__init__()
@@ -81,6 +219,7 @@ class PositionalEncoding(nn.Module):
     def forward(self, x):
         seq_len = x.size(1)
         return x + self.pe[:, :seq_len, :]
+
 
 class TimeEmbedding(nn.Module):
     def __init__(self, d_model, year_range=(1900, 2100), month_size=12, week_size=53, day_size=32, hour_size=24, minute_size=60):
@@ -104,6 +243,7 @@ class TimeEmbedding(nn.Module):
         return (self.year_embedding(year) + self.month_embedding(month) +
                 self.week_embedding(week) + self.day_embedding(day) +
                 self.hour_embedding(hour) + self.minute_embedding(minute))
+
 
 class InformerEncoderLayer(nn.Module):
     def __init__(self, d_model, nhead, d_ff, dropout, apply_distillation=True, use_prob_sparse=True):
@@ -138,6 +278,7 @@ class InformerEncoderLayer(nn.Module):
             x = x.transpose(1, 2)
         return x
 
+
 class InformerEncoder(nn.Module):
     def __init__(self, num_layers, d_model, nhead, d_ff, dropout, use_prob_sparse=True):
         super().__init__()
@@ -148,6 +289,7 @@ class InformerEncoder(nn.Module):
         for layer in self.layers:
             x = layer(x)
         return self.norm(x)
+
 
 class InformerDecoderLayer(nn.Module):
     def __init__(self, d_model, nhead, d_ff, dropout, use_prob_sparse=True):
@@ -178,6 +320,7 @@ class InformerDecoderLayer(nn.Module):
         x = self.norm3(x + self.ffn(x))
         return x
 
+
 class InformerDecoder(nn.Module):
     def __init__(self, num_layers, d_model, nhead, d_ff, dropout, use_prob_sparse=True):
         super().__init__()
@@ -188,6 +331,7 @@ class InformerDecoder(nn.Module):
         for layer in self.layers:
             x = layer(x, memory)
         return self.norm(x)
+
 
 class Informer(nn.Module):
     def __init__(self, input_dim=12, d_model=64, d_ff=256, nhead=8,
@@ -204,9 +348,9 @@ class Informer(nn.Module):
         self.pos_encoder = PositionalEncoding(d_model, max_len=encoder_length)
         self.pos_decoder = PositionalEncoding(d_model, max_len=decoder_length + prediction_length)
         self.encoder = InformerEncoder(num_layers=enc_layers, d_model=d_model,
-                                       nhead=nhead, d_ff=d_ff, dropout=dropout, use_prob_sparse=use_prob_sparse)
+                                        nhead=nhead, d_ff=d_ff, dropout=dropout, use_prob_sparse=use_prob_sparse)
         self.decoder = InformerDecoder(num_layers=dec_layers, d_model=d_model,
-                                       nhead=nhead, d_ff=d_ff, dropout=dropout, use_prob_sparse=use_prob_sparse)
+                                        nhead=nhead, d_ff=d_ff, dropout=dropout, use_prob_sparse=use_prob_sparse)
         self.output_projection = nn.Linear(d_model, input_dim)
         self.time_embed = TimeEmbedding(d_model)
 
@@ -226,210 +370,4 @@ class Informer(nn.Module):
             dec_input = dec_input + time_emb
         dec_output = self.decoder(dec_input, memory)
         output = self.output_projection(dec_output)
-        return output[:, -self.prediction_length:, :]
-
-def train_model(model, train_loader, val_loader, num_epochs, optimizer, criterion, device):
-    best_val_loss = float('inf')
-    epochs_without_improvement = 0
-    scaler = GradScaler() if device.type == 'cuda' else None
-    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', patience=2, factor=0.5, verbose=True)
-    
-    for epoch in range(num_epochs):
-        epoch_start_time = time.time()
-        model.train()
-        total_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs}", unit="batch")
-        for batch in pbar:
-            encoder = batch['encoder'].to(device)
-            decoder = batch['decoder'].to(device)
-            target = batch['target'].to(device)
-            optimizer.zero_grad()
-            
-            if scaler:
-                with autocast():
-                    output = model(encoder, decoder, target)
-                    loss = criterion(output, target)
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                output = model(encoder, decoder, target)
-                loss = criterion(output, target)
-                loss.backward()
-                optimizer.step()
-            
-            total_loss += loss.item()
-            pbar.set_postfix(loss=f"{loss.item():.6f}")
-            
-        avg_train_loss = total_loss / len(train_loader)
-        model.eval()
-        total_val_loss = 0.0
-        val_predictions = []
-        val_targets = []
-        with torch.no_grad():
-            for batch in val_loader:
-                encoder = batch['encoder'].to(device)
-                decoder = batch['decoder'].to(device)
-                target = batch['target'].to(device)
-                output = model(encoder, decoder, target)
-                loss = criterion(output, target)
-                total_val_loss += loss.item()
-                val_predictions.append(output)
-                val_targets.append(target)
-        avg_val_loss = total_val_loss / len(val_loader)
-        val_predictions = torch.cat(val_predictions, dim=0)
-        val_targets = torch.cat(val_targets, dim=0)
-        mae, rmse, mape = compute_metrics(val_predictions, val_targets)
-        epoch_duration = time.time() - epoch_start_time
-        current_lr = optimizer.param_groups[0]['lr']
-        print(f"Epoch {epoch+1}/{num_epochs} - Train Loss: {avg_train_loss:.6f}, Val Loss: {avg_val_loss:.6f}, "
-              f"MAE: {mae:.6f}, RMSE: {rmse:.6f}, MAPE: {mape:.2f}%, Duration: {epoch_duration:.2f}s, "
-              f"Best Val Loss: {best_val_loss:.6f}, LR: {current_lr:.6e}")
-        
-        scheduler.step(avg_val_loss)
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            epochs_without_improvement = 0
-            torch.save(model.state_dict(), "best_informer_model.pt")
-        else:
-            epochs_without_improvement += 1
-        
-        if epochs_without_improvement >= 3:
-            print("Early stopping triggered.")
-            break
-
-def evaluate_model(model, test_loader, criterion, device):
-    model.eval()
-    total_test_loss = 0.0
-    predictions = []
-    targets = []
-    datetime_list = []
-    
-    with torch.no_grad():
-        for batch in test_loader:
-            encoder = batch['encoder'].to(device)
-            decoder = batch['decoder'].to(device)
-            target = batch['target'].to(device)
-            output = model(encoder, decoder, target)
-            loss = criterion(output, target)
-            total_test_loss += loss.item()
-            predictions.append(output)
-            targets.append(target)
-            if 'datetime' in batch:
-                datetime_list.append(batch['datetime'])
-                
-    avg_test_loss = total_test_loss / len(test_loader)
-    print(f"Test Loss: {avg_test_loss:.6f}")
-    predictions = torch.cat(predictions, dim=0)
-    targets = torch.cat(targets, dim=0)
-    datetimes = [dt for sublist in datetime_list for dt in sublist] if datetime_list else None
-    return predictions, targets, datetimes
-
-def compute_metrics(pred, target):
-    pred_np = pred.cpu().numpy()
-    target_np = target.cpu().numpy()
-    mae = np.mean(np.abs(pred_np - target_np))
-    rmse = np.sqrt(np.mean((pred_np - target_np) ** 2))
-    mape = np.mean(np.abs((pred_np - target_np) / (target_np + 1e-5))) * 100
-    return mae, rmse, mape
-
-if __name__ == "__main__":
-    input_dim = 12
-    d_model = 64
-    d_ff = 256
-    nhead = 8
-    enc_layers = 3
-    dec_layers = 3
-    dropout = 0.05
-    encoder_length = 96
-    decoder_length = 48
-    prediction_length = 24
-    batch_size = 128
-    num_epochs = 50
-    learning_rate = 4e-5
-
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    
-    seed = 69
-    set_random_seed(seed)
-    print(f"Random seed set to: {seed}")
-    print(f"Using device: {device}")
-    
-    csv_path = "data/processed/SPY.csv"
-    stock_data_loader = StockDataLoader(csv_path, use_cyclical_encoding=True)
-    stock_data_loader.prepare_datasets()
-    train_loader, val_loader, test_loader = stock_data_loader.get_dataloaders(batch_size=batch_size)
-    
-    model = Informer(input_dim=input_dim, d_model=d_model, d_ff=d_ff, nhead=nhead,
-                     enc_layers=enc_layers, dec_layers=dec_layers, dropout=dropout,
-                     encoder_length=encoder_length, decoder_length=decoder_length,
-                     prediction_length=prediction_length, use_prob_sparse=True)
-    model.to(device)
-    
-    criterion = nn.MSELoss()
-    optimizer = Adam(model.parameters(), lr=learning_rate)
-    
-    train_model(model, train_loader, val_loader, num_epochs, optimizer, criterion, device)
-    predictions, targets, datetimes = evaluate_model(model, test_loader, criterion, device)
-    mae, rmse, mape = compute_metrics(predictions, targets)
-    print(f"Test Metrics - MAE: {mae:.6f}, RMSE: {rmse:.6f}, MAPE: {mape:.2f}%")
-    
-    pred_np = predictions.cpu().numpy()
-    target_np = targets.cpu().numpy()
-    close_price_mean = 100.0
-    close_price_std = 20.0
-    pred_np[:, :, 0] = pred_np[:, :, 0] * close_price_std + close_price_mean
-    target_np[:, :, 0] = target_np[:, :, 0] * close_price_std + close_price_mean
-    
-    sample_idx = 0
-    feature_idx = 0
-    pred_series = pred_np[sample_idx, :, feature_idx]
-    target_series = target_np[sample_idx, :, feature_idx]
-    time_steps = range(1, len(pred_series) + 1)
-    
-    results_folder = "results"
-    os.makedirs(results_folder, exist_ok=True)
-    
-    plt.figure(figsize=(10, 6))
-    plt.plot(time_steps, target_series, label="Ground Truth", marker='o')
-    plt.plot(time_steps, pred_series, label="Prediction", marker='x')
-    plt.xlabel("Time Step")
-    plt.ylabel("Close Price")
-    plt.title(f"Ground Truth vs Prediction (Sample {sample_idx}, Feature {feature_idx})")
-    plt.legend()
-    plt.grid(True)
-    plot_path = os.path.join(results_folder, "ground_truth_vs_prediction.png")
-    plt.savefig(plot_path)
-    plt.close()
-    print(f"Saved prediction plot to {plot_path}")
-    
-    num_samples, pred_length, _ = pred_np.shape
-    sample_ids = np.repeat(np.arange(num_samples), pred_length)
-    time_steps_full = np.tile(np.arange(pred_length), num_samples)
-    ground_truth_flat = target_np[:, :, feature_idx].flatten()
-    prediction_flat = pred_np[:, :, feature_idx].flatten()
-    
-    df = pd.DataFrame({
-        "sample": sample_ids,
-        "time_step": time_steps_full,
-        "ground_truth": ground_truth_flat,
-        "prediction": prediction_flat
-    })
-    if datetimes is not None:
-        if len(datetimes) == num_samples * pred_length:
-            df["datetime"] = datetimes
-        elif len(datetimes) == num_samples:
-            df["datetime"] = np.repeat(datetimes, pred_length)
-        else:
-            df["datetime"] = None
-    else:
-        df["datetime"] = None
-    
-    csv_path = os.path.join(results_folder, "test_predictions_vs_ground_truth.csv")
-    df.to_csv(csv_path, index=False)
-    print(f"Saved raw predictions and ground truth data to {csv_path}")
+        return output[:, -self.prediction_length:, :] 

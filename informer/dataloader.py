@@ -25,7 +25,7 @@ class StockDataset(Dataset):
 
 
 class StockDataLoader:
-    def __init__(self, csv_path, sequence_config=None, date_col='datetime', use_cyclical_encoding=False, include_technical_indicators=False):
+    def __init__(self, csv_path, sequence_config=None, date_col='datetime', use_cyclical_encoding=True, include_technical_indicators=True):
         """
         Initializes the data loader for historical stock data.
 
@@ -215,9 +215,11 @@ class StockDataLoader:
         """
         df = self.dataframe
 
+        # Basic technical indicators
         df['sma_close'] = df['close'].rolling(window=5, min_periods=1).mean()
         df['ema_close'] = df['close'].ewm(span=5, adjust=False).mean()
 
+        # RSI calculation
         delta = df['close'].diff()
         gain = delta.clip(lower=0)
         loss = -delta.clip(upper=0)
@@ -226,12 +228,14 @@ class StockDataLoader:
         rs = avg_gain / (avg_loss + 1e-10)
         df['rsi_14'] = 100 - (100 / (1 + rs))
 
+        # MACD calculation
         ema12 = df['close'].ewm(span=12, adjust=False).mean()
         ema26 = df['close'].ewm(span=26, adjust=False).mean()
         df['macd'] = ema12 - ema26
         df['macd_signal'] = df['macd'].ewm(span=9, adjust=False).mean()
         df['macd_histogram'] = df['macd'] - df['macd_signal']
 
+        # Bollinger Bands
         window = 20
         sma_20 = df['close'].rolling(window=window, min_periods=window).mean()
         std_20 = df['close'].rolling(window=window, min_periods=window).std()
@@ -242,22 +246,93 @@ class StockDataLoader:
         df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
 
         # -------------------------------
-        # New: Mixed‑Frequency and Aggregated Features
+        # Mixed‑Frequency and Aggregated Features
         df['5min_mean_close'] = df['close'].rolling(window=5, min_periods=1).mean()
         df['15min_mean_close'] = df['close'].rolling(window=15, min_periods=1).mean()
+        df['30min_mean_close'] = df['close'].rolling(window=30, min_periods=1).mean()  # Added 30min aggregation
 
-        # New: Rolling Volatility and Realized Variance
+        # Rolling Volatility and Realized Variance
         df['5min_rolling_volatility'] = df['close'].pct_change().rolling(window=5, min_periods=1).std()
         df['15min_rolling_volatility'] = df['close'].pct_change().rolling(window=15, min_periods=1).std()
         df['5min_realized_variance'] = (df['close'].pct_change() ** 2).rolling(window=5, min_periods=1).sum()
         df['15min_realized_variance'] = (df['close'].pct_change() ** 2).rolling(window=15, min_periods=1).sum()
 
-        # New: Interaction Terms and Nonlinear Transformations
+        # Interaction Terms and Nonlinear Transformations
         df['price_return'] = df['close'].pct_change()
         df['return_volume_interaction'] = df['price_return'] * df['volume']
         df['log_volume'] = np.log(df['volume'] + 1)
-        # -------------------------------
-
+        
+        # NEW: Advanced features and indicators
+        
+        # 1. Price gap calculations
+        df['gap_open'] = df['open'] - df['close'].shift(1)
+        df['gap_ratio'] = df['gap_open'] / df['close'].shift(1)
+        
+        # 2. Candlestick pattern features
+        df['candle_body'] = df['close'] - df['open']
+        df['candle_wick_upper'] = df['high'] - np.maximum(df['open'], df['close'])
+        df['candle_wick_lower'] = np.minimum(df['open'], df['close']) - df['low']
+        df['candle_body_ratio'] = df['candle_body'] / (df['high'] - df['low'] + 1e-10)
+        
+        # 3. Trend strength indicators
+        df['adx_up_move'] = df['high'] - df['high'].shift(1)
+        df['adx_down_move'] = df['low'].shift(1) - df['low']
+        df['adx_plus_di'] = 100 * df['adx_up_move'].clip(lower=0).rolling(window=14).mean() / df['true_range']
+        df['adx_minus_di'] = 100 * df['adx_down_move'].clip(lower=0).rolling(window=14).mean() / df['true_range']
+        df['adx_di_diff'] = abs(df['adx_plus_di'] - df['adx_minus_di'])
+        df['adx_di_sum'] = df['adx_plus_di'] + df['adx_minus_di']
+        df['adx'] = 100 * df['adx_di_diff'].rolling(window=14).mean() / df['adx_di_sum']
+        
+        # 4. Momentum indicators
+        # Rate of Change (ROC)
+        df['roc_5'] = (df['close'] / df['close'].shift(5) - 1) * 100
+        df['roc_10'] = (df['close'] / df['close'].shift(10) - 1) * 100
+        
+        # Williams %R
+        highest_high = df['high'].rolling(window=14).max()
+        lowest_low = df['low'].rolling(window=14).min()
+        df['williams_r'] = -100 * (highest_high - df['close']) / (highest_high - lowest_low + 1e-10)
+        
+        # 5. Volume-based indicators
+        # Chaikin Money Flow (CMF)
+        money_flow_multiplier = ((df['close'] - df['low']) - (df['high'] - df['close'])) / (df['high'] - df['low'] + 1e-10)
+        money_flow_volume = money_flow_multiplier * df['volume']
+        df['cmf'] = money_flow_volume.rolling(window=20).sum() / df['volume'].rolling(window=20).sum()
+        
+        # 6. Volatility indicators
+        # Average True Range (ATR)
+        tr1 = df['high'] - df['low']
+        tr2 = abs(df['high'] - df['close'].shift(1))
+        tr3 = abs(df['low'] - df['close'].shift(1))
+        df['true_range'] = np.maximum(np.maximum(tr1, tr2), tr3)
+        df['atr'] = df['true_range'].rolling(window=14).mean()
+        
+        # 7. Mean reversion indicators
+        df['zscore_5'] = (df['close'] - df['close'].rolling(window=5).mean()) / df['close'].rolling(window=5).std()
+        df['zscore_10'] = (df['close'] - df['close'].rolling(window=10).mean()) / df['close'].rolling(window=10).std()
+        
+        # 8. Stochastic Oscillator
+        df['stoch_k'] = 100 * (df['close'] - df['low'].rolling(window=14).min()) / (df['high'].rolling(window=14).max() - df['low'].rolling(window=14).min() + 1e-10)
+        df['stoch_d'] = df['stoch_k'].rolling(window=3).mean()
+        
+        # 9. Time series decomposition features (simplified)
+        # Trend component using long-term moving average
+        df['trend_component'] = df['close'].rolling(window=50, min_periods=1).mean()
+        # Seasonal component (daily pattern) using hour-of-day normalization
+        if 'hour' in df.columns:
+            df['hour_avg'] = df.groupby('hour')['close'].transform('mean')
+            df['seasonal_component'] = df['close'] / df['hour_avg']
+            
+        # 10. Cross-asset features (if we had multiple assets, we'd add correlations here)
+        
+        # 11. Price acceleration
+        df['price_acceleration'] = df['price_return'].diff()
+        
+        # 12. Volume profile
+        df['volume_ma5'] = df['volume'].rolling(window=5).mean()
+        df['volume_ma15'] = df['volume'].rolling(window=15).mean()
+        df['relative_volume'] = df['volume'] / df['volume_ma15']
+        
         # Drop rows with any missing values after indicator calculations
         df.dropna(inplace=True)
         self.dataframe = df
@@ -281,7 +356,7 @@ if __name__ == '__main__':
     csv_path = 'data/processed/SPY.csv'
 
     # Initialize the loader with cyclical encoding enabled for hour and minute features
-    data_loader = StockDataLoader(csv_path, use_cyclical_encoding=True)
+    data_loader = StockDataLoader(csv_path, use_cyclical_encoding=True, include_technical_indicators=False)
     data_loader.prepare_datasets()
     train_loader, val_loader, test_loader = data_loader.get_dataloaders(batch_size=32)
     
