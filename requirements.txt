@@ -1,0 +1,17 @@
+pandas>=1.5.0
+numpy>=1.21.0
+matplotlib>=3.5.0
+seaborn
+scikit-learn>=1.0.0
+requests
+python-dotenv
+tqdm>=4.65.0
+pandas-market-calendars
+requests_html 
+yahoo_fin
+wandb>=0.15.0
+torch>=2.0.0
+git+https://github.com/IBM/tsfm.git
+transformers
+ta>=0.10.0
+einops>=0.6.0

@@ -1,232 +1,341 @@
 import os
 import torch
-import torch.nn as nn
-from torch.optim import Adam
 import wandb
 import pandas as pd
 import numpy as np
+from sklearn.model_selection import train_test_split
+import time
+import matplotlib.pyplot as plt
+from io import BytesIO
 
-from informer.model_components import Informer
-from informer.training_utils import set_random_seed, train_model, evaluate_model, compute_metrics
-from informer.dataloader import StockDataLoader
-from informer.loss_functions import CombinedLoss, DirectionalLoss, AsymmetricLoss
-from informer.terminal_utils import (
-    print_header, print_subheader, print_success, print_info, 
-    print_warning, print_section_separator, print_config, clear_terminal,
-    print_timestamp
-)
+from model.patch_tst import PatchTST
+from model.data_processor import DataProcessor
+from model.trainer import PatchTSTTrainer
 
+# Configuration dictionary for easy modification
+CONFIG = {
+    # Data parameters
+    'seq_len': 100,          # Length of input sequence
+    'pred_len': 30,          # Length of prediction sequence
+    'data_path': 'data/processed/SPY.csv',
+    
+    # Training parameters
+    'batch_size': 128,
+    'num_epochs': 100,
+    'learning_rate': 1e-5,
+    'patience': 10,
+    
+    # Model parameters
+    'd_model': 128,          # Dimension of model
+    'n_heads': 4,            # Number of attention heads
+    'n_layers': 3,           # Number of transformer layers
+    'd_ff': 256,            # Dimension of feedforward network
+    'dropout': 0.1,         # Dropout rate
+    'fc_dropout': 0.1,      # Fully connected dropout rate
+    'head_dropout': 0.1,    # Head dropout rate
+    
+    # Patch parameters will be set dynamically
+    'patch_len_factor': 0.1,  # patch_len will be this fraction of seq_len
+    'stride_factor': 0.5,     # stride will be this fraction of patch_len
+}
+
+def calculate_patch_params(seq_len):
+    """Calculate patch_len and stride based on sequence length"""
+    # Calculate patch_len as a fraction of sequence length
+    patch_len = max(int(seq_len * CONFIG['patch_len_factor']), 1)
+    # Calculate stride as a fraction of patch_len
+    stride = max(int(patch_len * CONFIG['stride_factor']), 1)
+    return patch_len, stride
+
+def print_gpu_memory_usage():
+    """Print GPU memory usage for either CUDA or MPS"""
+    if torch.backends.mps.is_available():
+        print(f"MPS Memory: Current allocated: {torch.mps.current_allocated_memory() / 1e9:.2f} GB")
+        print(f"MPS Memory: Driver allocated: {torch.mps.driver_allocated_memory() / 1e9:.2f} GB")
+    elif torch.cuda.is_available():
+        print(f"CUDA Memory: Current allocated: {torch.cuda.memory_allocated() / 1e9:.2f} GB")
+        print(f"CUDA Memory: Max allocated: {torch.cuda.max_memory_allocated() / 1e9:.2f} GB")
+
+def load_data(file_path, use_chunks=False, chunksize=100000):
+    """Load and preprocess the data"""
+    print(f"Loading data from {file_path}...")
+    
+    # If use_chunks is enabled, process CSV in chunks to reduce memory footprint
+    if use_chunks:
+        chunks = []
+        for chunk in pd.read_csv(file_path, chunksize=chunksize):
+            try:
+                chunk['datetime'] = pd.to_datetime(chunk['datetime'])
+            except (ValueError, TypeError):
+                try:
+                    chunk['datetime'] = pd.to_datetime(chunk['datetime'], format='%Y-%m-%d %H:%M:%S')
+                except ValueError:
+                    chunk['datetime'] = pd.to_datetime(chunk['datetime'], infer_datetime_format=True)
+            chunks.append(chunk)
+        df = pd.concat(chunks, ignore_index=True)
+    else:
+        try:
+            df = pd.read_csv(file_path)
+            df['datetime'] = pd.to_datetime(df['datetime'])
+        except (ValueError, TypeError):
+            try:
+                df = pd.read_csv(file_path, parse_dates=['datetime'], date_parser=lambda x: pd.to_datetime(x, format='%Y-%m-%d %H:%M:%S'))
+            except ValueError:
+                df = pd.read_csv(file_path)
+                df['datetime'] = pd.to_datetime(df['datetime'], infer_datetime_format=True)
+    
+    # Ensure 'datetime' column is datetime type
+    if not pd.api.types.is_datetime64_any_dtype(df['datetime']):
+        df['datetime'] = pd.to_datetime(df['datetime'], errors='coerce')
+    
+    # Convert timezone-aware dates to naive dates if timezone info exists
+    if df['datetime'].dt.tz is not None:
+        df['datetime'] = df['datetime'].dt.tz_localize(None)
+    
+    df.set_index('datetime', inplace=True)
+    
+    # Sort index to ensure chronological order
+    df.sort_index(inplace=True)
+    
+    # Determine the data frequency
+    freq = pd.infer_freq(df.index)
+    if freq is None:
+        # If can't infer, check most common time difference
+        time_diff = df.index.to_series().diff().mode()[0]
+        freq = pd.Timedelta(time_diff).resolution_string
+    print(f"Detected data frequency: {freq}")
+    
+    # Check for missing values
+    missing_values = df.isnull().sum()
+    if missing_values.any():
+        print("Found missing values:")
+        print(missing_values[missing_values > 0])
+        
+        # Handle missing values using appropriate methods for financial time series
+        # 1. For very short gaps (1-2 points), use linear interpolation
+        df = df.interpolate(method='linear', limit=2)
+        
+        # 2. For slightly longer gaps (3-5 points), use cubic interpolation
+        df = df.interpolate(method='cubic', limit=5)
+        
+        # 3. For remaining gaps, use forward fill followed by backward fill
+        df = df.ffill().bfill()
+        
+    # Verify no missing values remain
+    if df.isnull().sum().any():
+        print("Warning: Some missing values could not be filled!")
+        
+    # Remove any duplicate indices
+    df = df[~df.index.duplicated(keep='first')]
+    
+    # Ensure the index is continuous at the detected frequency
+    full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq=freq)
+    df = df.reindex(full_idx)
+    
+    # Fill any new missing values created by reindexing
+    df = df.ffill().bfill()
+    
+    # Optimize memory usage: convert float64 columns to float32
+    for col in df.select_dtypes(include=['float64']).columns:
+        df[col] = df[col].astype('float32')
+    
+    print("Data cleaning completed.")
+    print(f"Final dataset shape: {df.shape}")
+    print(f"Date range: {df.index.min()} to {df.index.max()}")
+    
+    return df
+
+def calculate_mape(y_true, y_pred):
+    """Calculate Mean Absolute Percentage Error"""
+    y_true, y_pred = np.array(y_true), np.array(y_pred)
+    mask = y_true != 0
+    return np.mean(np.abs((y_true[mask] - y_pred[mask]) / y_true[mask])) * 100
+
+def plot_predictions_vs_actual(y_true, y_pred, title):
+    """Create a plot comparing predictions vs actual values"""
+    plt.figure(figsize=(12, 6))
+    plt.plot(y_true, label='Ground Truth', color='blue')
+    plt.plot(y_pred, label='Predictions', color='red', linestyle='--')
+    plt.title(title)
+    plt.xlabel('Time Steps')
+    plt.ylabel('Value')
+    plt.legend()
+    
+    # Save plot to buffer
+    buf = BytesIO()
+    plt.savefig(buf, format='png')
+    plt.close()
+    return buf
+
+def main():
+    print("\nRunning with configuration:")
+    for key, value in CONFIG.items():
+        print(f"{key}: {value}")
+    
+    # Set device
+    device = torch.device("cuda" if torch.cuda.is_available() 
+                         else "mps" if torch.backends.mps.is_available() 
+                         else "cpu")
+    print(f"Using device: {device}")
+    
+    # Load data
+    print("\nLoading data...")
+    df = load_data(CONFIG['data_path'])
+    
+    # Initialize data processor
+    data_processor = DataProcessor(seq_len=CONFIG['seq_len'], pred_len=CONFIG['pred_len'])
+    
+    # Prepare sequences and targets with timing
+    print("Preparing data sequences...")
+    start_time = time.time()
+    sequences, targets = data_processor.prepare_data(df.copy())
+    prep_time = time.time() - start_time
+    print(f"Data preparation took {prep_time:.2f} seconds")
+    
+    # Print sequence shape for debugging
+    print(f"Sequence shape: {sequences.shape}")
+    
+    # Calculate dynamic patch parameters based on sequence length
+    patch_len, stride = calculate_patch_params(sequences.shape[1])
+    print(f"\nDynamic patch parameters:")
+    print(f"patch_len: {patch_len}")
+    print(f"stride: {stride}")
+    
+    # Split data into train, validation, and test sets
+    train_seq, temp_seq, train_targets, temp_targets = train_test_split(
+        sequences, targets, test_size=0.3, random_state=42
+    )
+    val_seq, test_seq, val_targets, test_targets = train_test_split(
+        temp_seq, temp_targets, test_size=0.5, random_state=42
+    )
+    
+    print(f"Data shapes:")
+    print(f"Train: {train_seq.shape}")
+    print(f"Validation: {val_seq.shape}")
+    print(f"Test: {test_seq.shape}")
+    
+    # Initialize model with adjusted patch parameters
+    print("\nInitializing PatchTST model...")
+    model = PatchTST(
+        input_dim=train_seq.shape[2],  # Number of features
+        output_dim=1,  # Predicting close price
+        patch_len=patch_len,
+        stride=stride,
+        d_model=CONFIG['d_model'],
+        n_heads=CONFIG['n_heads'],
+        n_layers=CONFIG['n_layers'],
+        d_ff=CONFIG['d_ff'],
+        dropout=CONFIG['dropout'],
+        seq_len=CONFIG['seq_len'],
+        pred_len=CONFIG['pred_len'],
+        fc_dropout=CONFIG['fc_dropout'],
+        head_dropout=CONFIG['head_dropout']
+    )
+    
+    # Initialize trainer with W&B logging
+    trainer = PatchTSTTrainer(
+        model=model,
+        device=device,
+        batch_size=CONFIG['batch_size'],
+        num_epochs=CONFIG['num_epochs'],
+        learning_rate=CONFIG['learning_rate'],
+        patience=CONFIG['patience'],
+        use_wandb=True
+    )
+    
+    # Print GPU memory usage
+    print("\nInitial GPU memory usage:")
+    print_gpu_memory_usage()
+    
+    # Unsupervised pre-training
+    print("\nStarting unsupervised pre-training...")
+    trainer.pretrain(train_seq)
+    
+    # Load best pre-trained weights
+    trainer.load_pretrained()
+    
+    # Supervised training with test metrics logging
+    print("\nStarting supervised training...")
+    trainer.train(
+        train_seq=train_seq,
+        train_targets=train_targets,
+        val_seq=val_seq,
+        val_targets=val_targets,
+        test_seq=test_seq,
+        test_targets=test_targets
+    )
+    
+    # Load best model for evaluation
+    trainer.load_best_model()
+    
+    # Generate predictions on test set
+    print("\nGenerating test predictions...")
+    predictions = trainer.predict(test_seq)
+    
+    # Inverse transform predictions and targets
+    predictions = data_processor.inverse_transform(predictions.reshape(-1, 1))
+    test_targets = data_processor.inverse_transform(test_targets.reshape(-1, 1))
+    
+    # Calculate metrics
+    mse = np.mean((predictions - test_targets) ** 2)
+    rmse = np.sqrt(mse)
+    mae = np.mean(np.abs(predictions - test_targets))
+    mape = calculate_mape(test_targets, predictions)
+    
+    print("\nTest Metrics:")
+    print(f"MSE: {mse:.4f}")
+    print(f"RMSE: {rmse:.4f}")
+    print(f"MAE: {mae:.4f}")
+    print(f"MAPE: {mape:.2f}%")
+    
+    # Create and log prediction vs actual plot
+    plot_buf = plot_predictions_vs_actual(
+        test_targets, 
+        predictions, 
+        'Test Set: Predictions vs Ground Truth'
+    )
+    
+    # Log final test metrics and plot to W&B
+    if wandb.run is not None:
+        wandb.log({
+            "final_test/mse": mse,
+            "final_test/rmse": rmse,
+            "final_test/mae": mae,
+            "final_test/mape": mape,
+            "final_test/predictions_vs_actual": wandb.Image(plot_buf),
+            "final_test/predictions": wandb.Table(
+                data=[[i, float(true), float(pred)] for i, (true, pred) in enumerate(zip(test_targets, predictions))],
+                columns=["timestep", "ground_truth", "prediction"]
+            )
+        })
+        
+        # Log histograms of predictions and errors
+        wandb.log({
+            "final_test/prediction_distribution": wandb.Histogram(predictions),
+            "final_test/error_distribution": wandb.Histogram(predictions - test_targets),
+        })
+        
+        # Log scatter plot of predicted vs actual values
+        wandb.log({
+            "final_test/predicted_vs_actual_scatter": wandb.plot.scatter(
+                wandb.Table(data=[[x, y] for x, y in zip(test_targets, predictions)],
+                          columns=["ground_truth", "predictions"]),
+                "ground_truth",
+                "predictions"
+            )
+        })
+    
+    # Example of transfer learning on new data
+    print("\nExample of transfer learning on new data:")
+    new_df = df.copy()  # In practice, this would be new data
+    new_sequences, new_targets = data_processor.prepare_data(new_df, is_train=False)
+    
+    # Fine-tune on new data
+    trainer.train(new_sequences, new_targets)
+    
+    # Final GPU memory usage
+    print("\nFinal GPU memory usage:")
+    print_gpu_memory_usage()
 
 if __name__ == "__main__":
-    # Clear the terminal for a fresh start
-    clear_terminal()
-    
-    print_header("🚀 Stockcaster - Time Series Stock Prediction 📈", style="double")
-    print_timestamp("Script started at")
-    
-    # Model hyperparameters
-    d_model = 128
-    d_ff = 512
-    nhead = 8
-    enc_layers = 3
-    dec_layers = 3
-    dropout = 0.1
-    encoder_length = 96
-    decoder_length = 48
-    prediction_length = 24
-    batch_size = 64
-    num_epochs = 50
-    learning_rate = 4e-5
-
-    # Loss function hyperparameters
-    mse_weight = 0.7
-    mae_weight = 0.3
-    directional_weight = 0.25  # Set > 0 to enable
-    asymmetric_weight = 0.25   # Set > 0 to enable
-    asymmetric_alpha = 1.5    # > 1 to penalize under-predictions more
-    asymmetric_beta = 1.0     # > 1 to penalize over-predictions more
-
-    # Set up device
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    elif torch.cuda.is_available():
-        device = torch.device("cuda")
-    else:
-        device = torch.device("cpu")
-    
-    # Set random seed
-    seed = 69
-    set_random_seed(seed)
-    print_info(f"Random seed set to: {seed}")
-    print_info(f"Using device: {device}")
-
-    # Load data
-    print_section_separator()
-    print_subheader("Data Loading")
-    csv_path = "data/processed/SPY.csv"
-    print_info(f"Loading data from: {csv_path}")
-    
-    stock_data_loader = StockDataLoader(csv_path, use_cyclical_encoding=True, include_technical_indicators=False)
-    stock_data_loader.prepare_datasets()
-    train_loader, val_loader, test_loader = stock_data_loader.get_dataloaders(batch_size=batch_size)
-    
-    print_success(f"Data loaded successfully")
-    print_info(f"Train batches: {len(train_loader)}, Validation batches: {len(val_loader)}, Test batches: {len(test_loader)}")
-    
-    # Dynamically determine input dimension from the dataloader features
-    data_input_dim = stock_data_loader.features.shape[1]
-    print_info(f"Input dimension: {data_input_dim}")
-    
-    # Create config dictionary for wandb with dynamic input_dim
-    config = {
-        "model_type": "Informer",
-        "input_dim": data_input_dim,
-        "d_model": d_model,
-        "d_ff": d_ff,
-        "nhead": nhead,
-        "enc_layers": enc_layers,
-        "dec_layers": dec_layers,
-        "dropout": dropout,
-        "encoder_length": encoder_length,
-        "decoder_length": decoder_length,
-        "prediction_length": prediction_length,
-        "batch_size": batch_size,
-        "learning_rate": learning_rate,
-        "seed": seed,
-        "device": str(device),
-        # Loss function parameters
-        "loss_function": "CombinedLoss",
-        "mse_weight": mse_weight,
-        "mae_weight": mae_weight,
-        "directional_weight": directional_weight,
-        "asymmetric_weight": asymmetric_weight,
-        "asymmetric_alpha": asymmetric_alpha,
-        "asymmetric_beta": asymmetric_beta
-    }
-    
-    # Initialize wandb with the updated config
-    print_section_separator()
-    print_subheader("Wandb Initialization")
-    wandb.init(project="stockcaster", config=config)
-    print_success("Wandb initialized")
-    
-    # Create model using dynamic input dimension
-    print_section_separator()
-    print_subheader("Model Creation")
-    model = Informer(input_dim=data_input_dim, d_model=d_model, d_ff=d_ff, nhead=nhead,
-                     enc_layers=enc_layers, dec_layers=dec_layers, dropout=dropout,
-                     encoder_length=encoder_length, decoder_length=decoder_length,
-                     prediction_length=prediction_length, use_prob_sparse=True)
-    model.to(device)
-    print_success("Model created and moved to device")
-    
-    # Log model architecture
-    wandb.run.summary["model_architecture"] = str(model)
-    
-    # Set up loss and optimizer
-    print_section_separator()
-    print_subheader("Loss and Optimizer Setup")
-    criterion = CombinedLoss(
-        mse_weight=mse_weight, 
-        mae_weight=mae_weight,
-        directional_weight=directional_weight,
-        asymmetric_weight=asymmetric_weight,
-        asymmetric_alpha=asymmetric_alpha,
-        asymmetric_beta=asymmetric_beta
-    )
-    optimizer = Adam(model.parameters(), lr=learning_rate)
-    print_success("Loss function and optimizer initialized")
-    
-    # Train model and evaluate on test data during training
-    print_section_separator()
-    train_model(model, train_loader, val_loader, test_loader, num_epochs, optimizer, criterion, device, config)  
-    
-    # Final evaluation on test data
-    print_section_separator()
-    print_subheader("Final Model Evaluation")
-    predictions, targets, datetimes = evaluate_model(model, test_loader, criterion, device)
-    
-    # Additionally calculate metrics with standard MSE for comparison
-    standard_criterion = nn.MSELoss()
-    with torch.no_grad():
-        standard_loss = standard_criterion(predictions, targets).item()
-    mae, rmse, mape = compute_metrics(predictions, targets)
-    print_info(f"Standard MSE Loss: {standard_loss:.6f}")
-    
-    # Denormalize predictions for visualization
-    print_section_separator()
-    print_subheader("Visualizing Results")
-    pred_np = predictions.cpu().numpy()
-    target_np = targets.cpu().numpy()
-    close_price_mean = 100.0
-    close_price_std = 20.0
-    pred_np[:, :, 0] = pred_np[:, :, 0] * close_price_std + close_price_mean
-    target_np[:, :, 0] = target_np[:, :, 0] * close_price_std + close_price_mean
-    
-    # Create and save visualization
-    sample_idx = 0
-    feature_idx = 0
-    pred_series = pred_np[sample_idx, :, feature_idx]
-    target_series = target_np[sample_idx, :, feature_idx]
-    time_steps = range(1, len(pred_series) + 1)
-    
-    results_folder = "results"
-    os.makedirs(results_folder, exist_ok=True)
-    print_info(f"Created results folder: {results_folder}")
-    
-    import matplotlib.pyplot as plt
-    fig = plt.figure(figsize=(10, 6))
-    plt.plot(time_steps, target_series, label="Ground Truth", marker='o')
-    plt.plot(time_steps, pred_series, label="Prediction", marker='x')
-    plt.xlabel("Time Step")
-    plt.ylabel("Close Price")
-    plt.title(f"Ground Truth vs Prediction (Sample {sample_idx}, Feature {feature_idx})")
-    plt.legend()
-    plt.grid(True)
-    plot_path = os.path.join(results_folder, "ground_truth_vs_prediction.png")
-    plt.savefig(plot_path)
-    
-    if wandb.run is not None:
-        wandb.log({"final_test_predictions": wandb.Image(fig)})
-    
-    plt.close()
-    print_success(f"Saved prediction plot to {plot_path}")
-    
-    # Create and save results dataframe
-    print_section_separator()
-    print_subheader("Saving Results")
-    
-    num_samples, pred_length, _ = pred_np.shape
-    sample_ids = np.repeat(np.arange(num_samples), pred_length)
-    time_steps_full = np.tile(np.arange(pred_length), num_samples)
-    ground_truth_flat = target_np[:, :, feature_idx].flatten()
-    prediction_flat = pred_np[:, :, feature_idx].flatten()
-    
-    df = pd.DataFrame({
-        "sample": sample_ids,
-        "time_step": time_steps_full,
-        "ground_truth": ground_truth_flat,
-        "prediction": prediction_flat
-    })
-    if datetimes is not None:
-        if len(datetimes) == num_samples * pred_length:
-            df["datetime"] = datetimes
-        elif len(datetimes) == num_samples:
-            df["datetime"] = np.repeat(datetimes, pred_length)
-        else:
-            df["datetime"] = None
-    else:
-        df["datetime"] = None
-    
-    csv_path = os.path.join(results_folder, "test_predictions_vs_ground_truth.csv")
-    df.to_csv(csv_path, index=False)
-    print_success(f"Saved raw predictions and ground truth data to {csv_path}")
-    
-    if wandb.run is not None:
-        wandb.log({"predictions_table": wandb.Table(dataframe=df)})
-        wandb.finish()
-        print_success("Wandb run completed and finalized")
-    
-    print_section_separator()
-    print_header("Stockcaster Execution Completed! 🎉", style="hash")
-    print_timestamp("Script finished at") 
+    main() 

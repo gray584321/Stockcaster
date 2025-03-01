@@ -46,6 +46,7 @@ coverage.xml
 .hypothesis/
 .pytest_cache/
 
+
 # Translations
 *.mo
 *.pot
@@ -75,7 +76,14 @@ logs/
 # Data directories (raw/processed data)
 *.pt
 *.csv
+*.pth
 # Jupyter Notebook checkpoints
 .ipynb_checkpoints/ 
 .conda
-wandb
+wandb/
+.pth
+*.csv
+*.pt
+*.png
+*.pdf
+*.html
