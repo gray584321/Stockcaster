@@ -10,3 +10,6 @@ pandas-market-calendars
 requests_html 
 yahoo_fin
 wandb
+torch>=2.0.0
+git+https://github.com/IBM/tsfm.git
+transformers
