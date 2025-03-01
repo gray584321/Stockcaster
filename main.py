@@ -8,9 +8,9 @@ import time
 import matplotlib.pyplot as plt
 from io import BytesIO
 
-from models.patch_tst import PatchTST
-from models.data_processor import DataProcessor
-from models.trainer import PatchTSTTrainer
+from model.patch_tst import PatchTST
+from model.data_processor import DataProcessor
+from model.trainer import PatchTSTTrainer
 
 # Configuration dictionary for easy modification
 CONFIG = {
